@@ -1,0 +1,16 @@
+package com.example.sampleapp;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class CalculatorController {
+
+    @GetMapping("/add")
+    public int add(@RequestParam int a, @RequestParam int b) {
+        // Off-by-one regression, injected for the self-healing CI demo.
+        return a + b + 1;
+    }
+
+}

@@ -1,0 +1,188 @@
+name: Self-Healing CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      failure_scenario:
+        description: Inject a failure scenario for demo purposes
+        type: choice
+        default: none
+        options:
+          - none
+          - deterministic-bug
+          - flaky-test
+          - dependency-mismatch
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare-demo:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.failure_scenario != 'none'
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.push.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Inject scenario and push demo branch
+        id: push
+        run: |
+          set -e
+          BRANCH="demo/${{ github.event.inputs.failure_scenario }}"
+          git checkout -b "$BRANCH"
+          python3 scripts/inject_scenario.py "${{ github.event.inputs.failure_scenario }}"
+          git add -A
+          git commit -m "Inject ${{ github.event.inputs.failure_scenario }} for self-healing CI demo"
+          git push -f origin "HEAD:$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+  build-and-test:
+    needs: prepare-demo
+    if: always() && (needs.prepare-demo.result == 'success' || needs.prepare-demo.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-demo.outputs.branch || github.ref }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+      - name: Run tests
+        id: test
+        run: |
+          set +e
+          ./mvnw -B test > build.log 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+      - name: Fail job if tests failed
+        if: steps.test.outputs.exit_code != '0'
+        run: exit 1
+
+  classify-failure:
+    needs: [prepare-demo, build-and-test]
+    if: failure()
+    runs-on: ubuntu-latest
+    outputs:
+      category: ${{ steps.classify.outputs.category }}
+      auto_fixable: ${{ steps.classify.outputs.auto_fixable }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-demo.outputs.branch || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-log
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Classify failure with Groq
+        id: classify
+        working-directory: scripts
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          cp ../build.log .
+          python3 classify_failure.py build.log
+          mv classification.json ..
+      - uses: actions/upload-artifact@v4
+        with:
+          name: classification
+          path: classification.json
+
+  auto-remediate:
+    needs: [prepare-demo, classify-failure]
+    if: github.event_name == 'workflow_dispatch' && needs.classify-failure.outputs.auto_fixable == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-demo.outputs.branch }}
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+      - uses: actions/download-artifact@v4
+        with:
+          name: classification
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Restore known-good files
+        working-directory: scripts
+        run: |
+          git fetch origin main
+          python3 restore_good.py "${{ github.event.inputs.failure_scenario }}"
+      - name: Verify fix is green
+        run: ./mvnw -B test
+      - name: Commit and push fix
+        run: |
+          git add -A
+          git commit -m "🤖 Auto-fix: $(python3 -c "import json;print(json.load(open('classification.json'))['category'])")"
+          git push origin "HEAD:${{ needs.prepare-demo.outputs.branch }}"
+      - name: Open remediation PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CATEGORY=$(python3 -c "import json;print(json.load(open('classification.json'))['category'])")
+          ROOT_CAUSE=$(python3 -c "import json;print(json.load(open('classification.json'))['root_cause'])")
+          FIX_SUMMARY=$(python3 -c "import json;print(json.load(open('classification.json'))['suggested_fix_summary'])")
+          gh pr create \
+            --base main \
+            --head "${{ needs.prepare-demo.outputs.branch }}" \
+            --title "🤖 Auto-fix: $CATEGORY" \
+            --body "**Root cause (LLM classification):** $ROOT_CAUSE
+
+          **Fix applied:** $FIX_SUMMARY
+
+          This PR was opened automatically by the self-healing CI pipeline after classifying a test failure as \`$CATEGORY\` (auto-fixable). See the workflow run for the full build log and classification." \
+            || gh pr edit "${{ needs.prepare-demo.outputs.branch }}" --body "Updated by a new self-healing CI run. Root cause: $ROOT_CAUSE"
+
+  flag-flaky:
+    needs: [prepare-demo, classify-failure]
+    if: needs.classify-failure.outputs.category == 'flaky_test'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-demo.outputs.branch || github.ref }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+      - name: Retry to confirm flakiness
+        run: |
+          {
+            echo "## Flaky test detected"
+            echo
+            echo "The self-healing pipeline classified this failure as \`flaky_test\` and is retrying instead of proposing a code fix."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          for i in 1 2 3; do
+            echo "### Retry $i" >> "$GITHUB_STEP_SUMMARY"
+            if ./mvnw -B test > "retry-$i.log" 2>&1; then
+              echo "PASSED" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "FAILED" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          {
+            echo
+            echo "**Recommendation:** quarantine this test and investigate timing assumptions rather than auto-patching application code."
+          } >> "$GITHUB_STEP_SUMMARY"
